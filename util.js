@@ -1,6 +1,9 @@
+/**
+ * A bunch of utility functions common to multiple scripts
+ */
+
 const path = require('path');
 const URL = require('url');
-const { JSDOM } = require('jsdom');
 const baseFetch = require('fetch-filecache-for-crawling');
 const respecWriter = require("respec/tools/respecDocWriter").fetchAndWrite;
 
@@ -60,6 +63,70 @@ function fetch(url, options) {
 }
 
 
+////////////////////////////////////////////////////////////////////////////////
+// UGLY CODE WARNING
+//
+// JSDOM no longer exposes any mechanism to provide one's own resource loader,
+// which is a pity, because we need it! The next few lines are a horrible hack
+// to intercept HTTP requests made by JSDOM so that we can:
+// 1. filter those we're not interested in (e.g. requests to stylesheets and
+// non-essential scripts)
+// 2. use our local HTTP cache so that we download resources only once
+//
+// The hack overrides the `download` method of the `resourceLoader` module in
+// JSDOM so that further calls to `require` on that module use our version.
+// This is as ugly as code can get but it works.
+
+// NB: this may well break when switching to a new version of JSDOM (but then,
+// hopefully, it will soon be again possible to provide one's own resource
+// loader to JSDOM...)
+////////////////////////////////////////////////////////////////////////////////
+const resourceLoader = require('jsdom/lib/jsdom/browser/resource-loader');
+resourceLoader.download = function (url, options, callback) {
+    // Restrict resource loading to ReSpec and script resources that sit next
+    // to the spec under test, excluding scripts of WebIDL as well as the
+    // WHATWG annotate_spec script that JSDOM does not seem to like.
+    // Explicitly whitelist the "autolink" script of the shadow DOM spec which
+    // is needed to initialize respecConfig
+    function fetchNeeded() {
+        let referrer = options.referrer;
+        if (!referrer.endsWith('/')) {
+            referrer = referrer.substring(0, referrer.lastIndexOf('/') + 1);
+        }
+        if (/\/respec\//i.test(url.path)) {
+            console.log(`fetch ReSpec at ${url.href}`);
+            return true;
+        }
+        else if ((url.pathname === '/webcomponents/assets/scripts/autolink.js') ||
+            (url.href.startsWith(referrer) &&
+                !(/annotate_spec/i.test(url.pathname)) &&
+                !(/link-fixup/i.test(url.pathname)) &&
+                !(/bug-assist/i.test(url.pathname)) &&
+                !(/dfn/i.test(url.pathname)) &&
+                !(/section-links/i.test(url.pathname)) &&
+                !(/^\/webidl\//i.test(url.pathname)))) {
+            console.log(`fetch useful script at ${url.href}`);
+            return true;
+        }
+        console.log(`fetch not needed for ${url.href}`);
+        return false;
+    }
+
+    if (fetchNeeded()) {
+        fetch(url.href, options)
+            .then(response => response.text())
+            .then(data => callback(null, data))
+            .catch(err => callback(err));
+    }
+    else {
+        callback(null, '');
+    }
+};
+
+// That's it, JSDOM will now use our `download` function.
+const { JSDOM } = require('jsdom');
+
+
 /**
  * Load the given HTML.
  *
@@ -84,13 +151,32 @@ function loadSpecificationFromHtml(spec, counter) {
     let html = spec.html || '';
     counter = counter || 0;
 
-    return new Promise((resolve, reject) => {
+    let promise = new Promise((resolve, reject) => {
         // Drop Byte-Order-Mark character if needed, it bugs JSDOM
         if (html.charCodeAt(0) === 0xFEFF) {
             html = html.substring(1);
         }
-        const {window} = new JSDOM(html, {url: responseUrl});
-        const doc = window.document;
+        const {window} = new JSDOM(html, {
+            url: responseUrl,
+            resources: 'usable',
+            runScripts: 'dangerously',
+            beforeParse(window) {
+                window.addEventListener('load', _ => {
+                    if (window.document.respecIsReady) {
+                        window.document.respecIsReady
+                            .then(_=> resolve(window))
+                            .catch(reject);
+                    }
+                    else {
+                        resolve(window);
+                    }
+                });
+            }
+        });
+    });
+
+    return promise.then(window => {
+        let doc = window.document;
 
         // Handle <meta http-equiv="refresh"> redirection
         // Note that we'll assume that the number in "content" is correct
@@ -100,45 +186,31 @@ function loadSpecificationFromHtml(spec, counter) {
             if (redirectUrl) {
                 redirectUrl = URL.resolve(doc.baseURI, redirectUrl.trim());
                 if ((redirectUrl !== url) && (redirectUrl !== responseUrl)) {
-                    loadSpecificationFromUrl(redirectUrl, counter + 1)
-                        .then(window => resolve(window))
-                        .catch(err => reject(err));
-                    return;
+                    return loadSpecificationFromUrl(redirectUrl, counter + 1);
                 }
             }
         }
 
-        // ReSpec doc
-        if (doc.querySelector("script[src*='respec']")) {
-            // this does another network fetch :(
-            return respecWriter(url, '', {}, 20000).then(function(html) {
-                const dom = new JSDOM(html, {url: responseUrl});
-                resolve(dom.window);
-            }).catch(reject);
-        } else { // ReSpec doesn't do multipages in any case
-            const links = doc.querySelectorAll('body .head dl a[href]');
-            for (let i = 0 ; i < links.length; i++) {
-                let link = links[i];
-                let text = (link.textContent || '').toLowerCase();
-                if (text.includes('single page') ||
-                    text.includes('single file') ||
-                    text.includes('single-page') ||
-                    text.includes('one-page')) {
-                    let singlePage = URL.resolve(doc.baseURI, link.getAttribute('href'));
-                    if ((singlePage === url) || (singlePage === responseUrl)) {
-                        // We're already looking at the single page version
-                        resolve(window);
-                    }
-                    else {
-                        loadSpecificationFromUrl(singlePage, counter + 1)
-                            .then(window => resolve(window))
-                            .catch(err => reject(err));
-                    }
-                    return;
+        const links = doc.querySelectorAll('body .head dl a[href]');
+        for (let i = 0 ; i < links.length; i++) {
+            let link = links[i];
+            let text = (link.textContent || '').toLowerCase();
+            if (text.includes('single page') ||
+                text.includes('single file') ||
+                text.includes('single-page') ||
+                text.includes('one-page')) {
+                let singlePage = URL.resolve(doc.baseURI, link.getAttribute('href'));
+                if ((singlePage === url) || (singlePage === responseUrl)) {
+                    // We're already looking at the single page version
+                    return window;
                 }
+                else {
+                    return loadSpecificationFromUrl(singlePage, counter + 1);
+                }
+                return;
             }
         }
-        resolve(window);
+        return window;
     });
 }
 
