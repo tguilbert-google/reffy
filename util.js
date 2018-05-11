@@ -88,39 +88,71 @@ resourceLoader.download = function (url, options, callback) {
     // WHATWG annotate_spec script that JSDOM does not seem to like.
     // Explicitly whitelist the "autolink" script of the shadow DOM spec which
     // is needed to initialize respecConfig
-    function fetchNeeded() {
+    function getUrlToFetch() {
         let referrer = options.referrer;
         if (!referrer.endsWith('/')) {
             referrer = referrer.substring(0, referrer.lastIndexOf('/') + 1);
         }
-        if (/\/respec\//i.test(url.path)) {
-            console.log(`fetch ReSpec at ${url.href}`);
-            return true;
+        if (/\/respec[\/\-]/i.test(url.path)) {
+            console.log(`fetch ReSpec (force latest version)`);
+            return 'https://www.w3.org/Tools/respec/respec-w3c-common';
+        }
+        else if (/\.[^\/\.]+$/.test(url.path) &&
+                !url.path.endsWith('.js') &&
+                !url.path.endsWith('.json')) {
+            console.log(`fetch not needed for ${url.href} (not a JS/JSON file)`);
+            return null;
         }
         else if ((url.pathname === '/webcomponents/assets/scripts/autolink.js') ||
             (url.href.startsWith(referrer) &&
                 !(/annotate_spec/i.test(url.pathname)) &&
-                !(/link-fixup/i.test(url.pathname)) &&
+                !(/expanders/i.test(url.pathname)) &&
                 !(/bug-assist/i.test(url.pathname)) &&
                 !(/dfn/i.test(url.pathname)) &&
                 !(/section-links/i.test(url.pathname)) &&
                 !(/^\/webidl\//i.test(url.pathname)))) {
             console.log(`fetch useful script at ${url.href}`);
-            return true;
+            return url.href;
         }
         console.log(`fetch not needed for ${url.href}`);
-        return false;
+        return null;
     }
 
-    if (fetchNeeded()) {
-        fetch(url.href, options)
-            .then(response => response.text())
-            .then(data => callback(null, data))
-            .catch(err => callback(err));
+    let urlToFetch = getUrlToFetch();
+    if (!urlToFetch) {
+        return callback(null, '');
     }
-    else {
-        callback(null, '');
-    }
+    fetch(urlToFetch, options)
+        .then(response => response.text())
+        .then(data => {
+            if (urlToFetch !== 'https://www.w3.org/Tools/respec/respec-w3c-common') {
+                return data;
+            }
+
+            // Tweak Respec code so that it runs in JSDOM
+            // Remove core/highlight module because JSDOM does not yet
+            // support URL.createObjectURL
+            // https://github.com/jsdom/jsdom/issues/1721
+            ["core/highlight"].forEach(module => data = data.replace(
+                new RegExp('(define\\(\\s*"profile-w3c-common"\\s*,\\s*\\[[^\\]]+),\\s*"' + module + '"'),
+                '$1'));
+
+            // JSDOM's CSS parser does not quite like uncommon "@" rules
+            // so let's pretend they are just @media rules
+            // https://github.com/jsdom/jsdom/issues/2026
+            data = data.replace(/@keyframes \S+? {/, '@media all {');
+            data = data.replace(/@supports \(.+?\) {/, '@media all {');
+
+            // JSDOM does not yet support innerText. Only used in Respec
+            // to set text of empty elements, so replacing with
+            // textContent should be good enough
+            // https://github.com/jsdom/jsdom/issues/1245
+            data = data.replace(/\.innerText=/g, '.textContent=');
+            data = data.replace(/body\.innerText/g, 'body.textContent');
+            return data;
+        })
+        .then(data => callback(null, data))
+        .catch(err => callback(err));
 };
 
 // That's it, JSDOM will now use our `download` function.
@@ -145,7 +177,7 @@ const { JSDOM } = require('jsdom');
  * @return {Promise} The promise to get a window object once the spec has
  *   been loaded with jsdom.
  */
-function loadSpecificationFromHtml(spec, counter) {
+async function loadSpecificationFromHtml(spec, counter) {
     let url = spec.url || 'about:blank';
     let responseUrl = spec.responseUrl || url;
     let html = spec.html || '';
@@ -161,16 +193,114 @@ function loadSpecificationFromHtml(spec, counter) {
             resources: 'usable',
             runScripts: 'dangerously',
             beforeParse(window) {
-                window.addEventListener('load', _ => {
-                    if (window.document.respecIsReady) {
-                        window.document.respecIsReady
-                            .then(_=> resolve(window))
-                            .catch(reject);
+                // Wait until the generation of Respec documents is over
+                window.addEventListener('load', function () {
+                    let usesRespec = window.respecConfig &&
+                        window.document.head.querySelector("script[src*='respec']");
+                    let resolveWhenReady = _ => {
+                        if (window.document.respecIsReady) {
+                            window.document.respecIsReady
+                                .then(_=> resolve(window))
+                                .catch(reject);
+                        }
+                        else if (usesRespec) {
+                            setTimeout(resolveWhenReady, 100);
+                        }
+                        else {
+                            resolve(window);
+                        }
                     }
-                    else {
-                        resolve(window);
-                    }
+                    resolveWhenReady();
                 });
+
+                // Not yet supported in JSDOM
+                // https://github.com/jsdom/jsdom/issues/1890
+                window.Element.prototype.insertAdjacentElement =
+                    window.Element.prototype.insertAdjacentElement ||
+                    function (position, element) {
+                        switch (position.toLowerCase()) {
+                            case 'beforebegin':
+                                this.parentElement.insertBefore(element, this);
+                                break;
+                            case 'afterbegin':
+                                if (this.firstChild) {
+                                    this.insertBefore(element, this.firstChild);
+                                } else {
+                                    this.appendChild(element);
+                                }
+                                break;
+                            case 'beforeend':
+                                this.appendChild(element);
+                                break;
+                            case 'afterend':
+                                this.parentElement.appendChild(element);
+                                this.after(element);
+                                break;
+                        }
+                        return element;
+                    };
+
+                // Not yet supported in JSDOM
+                // https://github.com/jsdom/jsdom/issues/1555
+                window.Element.prototype.closest =
+                    window.Element.prototype.closest ||
+                    function (selector) {
+                        var el = this;
+                        if (!this.ownerDocument.documentElement.contains(el)) return null;
+                        do {
+                            if (el.matches(selector)) return el;
+                            el = el.parentElement || el.parentNode;
+                        } while (el !== null && el.nodeType === 1);
+                        return null;
+                    };
+
+                // Not yet supported in JSDOM for attributes
+                // (but needed by HyperHTML)
+                // https://github.com/jsdom/jsdom/commit/acf0156b563b5e2ba606da36fd597e0a0b344f5a
+                window.Attr.prototype.cloneNode =
+                    window.Attr.prototype.cloneNode ||
+                    function () {
+                        if (!this.ownerDocument) {
+                            // Not sure how this can happen, but it does happen :(
+                            // Not much we can do about it except returning the
+                            // attribute without cloning it (returning null crashes)
+                            return this;
+                        }
+                        return this.ownerDocument.createAttributeNS(
+                            this.namespaceURI, this.name, this.value);
+                    };
+
+                // Not yet supported in JSDOM
+                // https://github.com/jsdom/jsdom/blob/master/test/web-platform-tests/to-upstream/html/browsers/the-window-object/window-properties-dont-upstream.html#L104
+                window.matchMedia =
+                    window.matchMedia ||
+                    function () {
+                        return {
+                            matches: false,
+                            addListener: () => {},
+                            removeListener: () => {},
+                            onchange: () => {}
+                        };
+                    };
+
+                // Not yet supported in JSDOM
+                // (and actually, good for us since we want to control caching
+                // logic here)
+                // https://github.com/jsdom/jsdom/issues/1724
+                window.fetch = function (url, options) {
+                    if (!url.startsWith('http:') || !url.startsWith('https:')) {
+                        let a = window.document.createElement('a');
+                        a.href = url;
+                        url = a.href;
+                    }
+                    return fetch(url, options);
+                };
+
+                // Not yet supported in JSDOM
+                // (most are not used in our specs, but some still call "scrollBy")
+                // https://github.com/jsdom/jsdom/blob/master/lib/jsdom/browser/Window.js#L570
+                ['blur', 'focus', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'scroll', 'scrollBy', 'scrollTo']
+                    .forEach(method => window[method] = function () {});
             }
         });
     });
