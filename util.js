@@ -5,6 +5,7 @@
 const path = require('path');
 const URL = require('url');
 const baseFetch = require('fetch-filecache-for-crawling');
+const { Headers, Request, Response } = require('node-fetch');
 const respecWriter = require("respec/tools/respecDocWriter").fetchAndWrite;
 
 
@@ -76,10 +77,17 @@ function fetch(url, options) {
 // The hack overrides the `download` method of the `resourceLoader` module in
 // JSDOM so that further calls to `require` on that module use our version.
 // This is as ugly as code can get but it works.
-
-// NB: this may well break when switching to a new version of JSDOM (but then,
-// hopefully, it will soon be again possible to provide one's own resource
-// loader to JSDOM...)
+//
+// Also, Respec cannot run as-is in JSDOM, because JSDOM lacks support for a
+// number of features that Respec needs.
+//
+// NB: The override may well break when switching to a new version of JSDOM
+// (but then, hopefully, it will soon be again possible to provide one's own
+// resource loader to JSDOM...)
+//
+// NB: Tweaking Respec code is even worse and may well break with every new
+// version of Respec because there is no guarantee that builds produce the same
+// variable names...
 ////////////////////////////////////////////////////////////////////////////////
 const resourceLoader = require('jsdom/lib/jsdom/browser/resource-loader');
 resourceLoader.download = function (url, options, callback) {
@@ -88,6 +96,7 @@ resourceLoader.download = function (url, options, callback) {
     // WHATWG annotate_spec script that JSDOM does not seem to like.
     // Explicitly whitelist the "autolink" script of the shadow DOM spec which
     // is needed to initialize respecConfig
+    const respecUrl = 'https://www.w3.org/Tools/respec/respec-w3c-common';
     function getUrlToFetch() {
         let referrer = options.referrer;
         if (!referrer.endsWith('/')) {
@@ -95,7 +104,7 @@ resourceLoader.download = function (url, options, callback) {
         }
         if (/\/respec[\/\-]/i.test(url.path)) {
             console.log(`fetch ReSpec (force latest version)`);
-            return 'https://www.w3.org/Tools/respec/respec-w3c-common';
+            return respecUrl;
         }
         else if (/\.[^\/\.]+$/.test(url.path) &&
                 !url.path.endsWith('.js') &&
@@ -125,15 +134,27 @@ resourceLoader.download = function (url, options, callback) {
     fetch(urlToFetch, options)
         .then(response => response.text())
         .then(data => {
-            if (urlToFetch !== 'https://www.w3.org/Tools/respec/respec-w3c-common') {
+            if (urlToFetch !== respecUrl) {
                 return data;
             }
 
-            // Tweak Respec code so that it runs in JSDOM
+            ////////////////////////////////////////////////////////////
+            // REALLY UGLY CODE WARNING
+            //
+            // Tweak Respec built code so that it can run in JSDOM.
+            //
+            // NB: Some of these lines will just break if Respec build
+            // produces slightly different code, e.g. if variables do
+            // not end up with the same name!
+            ////////////////////////////////////////////////////////////
+
             // Remove core/highlight module because JSDOM does not yet
             // support URL.createObjectURL
             // https://github.com/jsdom/jsdom/issues/1721
-            ["core/highlight"].forEach(module => data = data.replace(
+            // Remove core/list-sorter module because JSDOM does not yet
+            // support document.createRange
+            // https://github.com/jsdom/jsdom/blob/master/lib/jsdom/living/nodes/Document.webidl#L39
+            ["core/highlight", "core/list-sorter"].forEach(module => data = data.replace(
                 new RegExp('(define\\(\\s*"profile-w3c-common"\\s*,\\s*\\[[^\\]]+),\\s*"' + module + '"'),
                 '$1'));
 
@@ -149,7 +170,32 @@ resourceLoader.download = function (url, options, callback) {
             // https://github.com/jsdom/jsdom/issues/1245
             data = data.replace(/\.innerText=/g, '.textContent=');
             data = data.replace(/body\.innerText/g, 'body.textContent');
+
+            // Respec drops blank lines in Markdown, but marked.js actually
+            // needs them around <pre> tags, otherwise it produces really weird
+            // HTML (with <pre> and <p> intertwined). For some reason, this does
+            // not bother regular browsers. It does bother JSDOM though.
+            data = data.replace(/r\.createTextNode\("\\n"\)/, 'r.createTextNode("\\n\\n")');
+
+            // JSDOM does not support cloning of attributes yet, and polyfill
+            // only works for attributes that already belong to a document.
+            // HyperHTML needs to clone attributes that do not belong to the
+            // document, so let's intercept the call to `cloneNode` in HyperHTML
+            // and use `createAttributeNS` instead
+            // https://github.com/jsdom/jsdom/commit/acf0156b563b5e2ba606da36fd597e0a0b344f5a
+            data = data.replace(/p=r\.cloneNode\(!0\);/,
+                `p = null;
+                if (r.ownerDocument) {
+                    p = r.cloneNode(true);
+                } else {
+                    p = document.createAttributeNS(r.namespaceURI,r.name);
+                    p.value = r.value;
+                }`);
+
             return data;
+            ////////////////////////////////////////////////////////////
+            // END OF REALLY UGLY CODE WARNING
+            ////////////////////////////////////////////////////////////
         })
         .then(data => callback(null, data))
         .catch(err => callback(err));
@@ -157,6 +203,19 @@ resourceLoader.download = function (url, options, callback) {
 
 // That's it, JSDOM will now use our `download` function.
 const { JSDOM } = require('jsdom');
+
+// Also, Node.js is prompt to output warnings on what it thinks are unhandled
+// promise rejections but are usually rejections that are handled asynchronously
+// (i.e. not on the same tick). Let's intercept these warnings not to output
+// false positives.
+process.on('unhandledRejection', () => {});
+process.on('rejectionHandled', () => {});
+
+////////////////////////////////////////////////////////////////////////////////
+// END OF UGLY CODE WARNING
+//
+// The code below may be ugly, but at least it can be improved :)
+////////////////////////////////////////////////////////////////////////////////
 
 
 /**
@@ -261,13 +320,18 @@ async function loadSpecificationFromHtml(spec, counter) {
                     window.Attr.prototype.cloneNode ||
                     function () {
                         if (!this.ownerDocument) {
-                            // Not sure how this can happen, but it does happen :(
-                            // Not much we can do about it except returning the
-                            // attribute without cloning it (returning null crashes)
-                            return this;
+                            // Cloning an attribute that does not yet belong to
+                            // a document is possible in theory, but we have a
+                            // major problem here: we simply do not have any
+                            // pointer to the window/document that triggers
+                            // the request (and prototypes are shared across
+                            // browser contexts in JSDOM)
+                            throw new Error('Cannot clone an attribute that does not belong to a document!');
                         }
-                        return this.ownerDocument.createAttributeNS(
-                            this.namespaceURI, this.name, this.value);
+                        let attr = this.ownerDocument.createAttributeNS(
+                            this.namespaceURI, this.name);
+                        attr.value = this.value;
+                        return attr;
                     };
 
                 // Not yet supported in JSDOM
@@ -288,6 +352,15 @@ async function loadSpecificationFromHtml(spec, counter) {
                 // logic here)
                 // https://github.com/jsdom/jsdom/issues/1724
                 window.fetch = function (url, options) {
+                    if (url.url) {
+                        // Called with a Request object
+                        if (url.headers) {
+                            options = Object.assign({}, options, {
+                                headers: url.headers
+                            });
+                        }
+                        url = url.url;
+                    }
                     if (!url.startsWith('http:') || !url.startsWith('https:')) {
                         let a = window.document.createElement('a');
                         a.href = url;
@@ -295,12 +368,25 @@ async function loadSpecificationFromHtml(spec, counter) {
                     }
                     return fetch(url, options);
                 };
+                window.Request = Request;
+                window.Response = Response;
+                window.Headers = Headers;
 
                 // Not yet supported in JSDOM
                 // (most are not used in our specs, but some still call "scrollBy")
                 // https://github.com/jsdom/jsdom/blob/master/lib/jsdom/browser/Window.js#L570
                 ['blur', 'focus', 'moveBy', 'moveTo', 'resizeBy', 'resizeTo', 'scroll', 'scrollBy', 'scrollTo']
                     .forEach(method => window[method] = function () {});
+
+                // Not much we can do but:
+                // 1. JSDOM does not support `IndexedDB`, which Respec uses to
+                // store the biblio. No big deal as Respec degrades gracefully
+                // but that outputs errors to the console when trying to call
+                // `IndexedDB.open`
+                // https://github.com/jsdom/jsdom/issues/1748
+                // 2. JSDOM does not support the `whatToShow` filter in
+                // `TreeWalker`. As a result, HyperHTML fails to remove the
+                // `<!-- _hyper: xxxx -->` comments it adds while running.
             }
         });
     });
